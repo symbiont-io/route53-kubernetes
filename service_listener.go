@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -13,9 +14,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/elb"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/golang/glog"
+
+	"golang.org/x/net/publicsuffix"
+
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/client/restclient"
 	"k8s.io/kubernetes/pkg/client/transport"
@@ -126,17 +129,10 @@ func main() {
 		for i := range services.Items {
 			s := &services.Items[i]
 
-			hostOrIp, err := serviceHostname(s)
-			recordType := "CNAME"
-			if err != nil || hostOrIp == "" {
-				glog.Warningf("Couldn't find hostname for %s: %s", s.Name, err)
-				hostOrIp, err = serviceIP(s)
-				if err != nil || hostOrIp == "" {
-					glog.Warningf("Couldn't find IP for %s: %s", s.Name, err)
-					continue
-				} else {
-					recordType = "A"
-				}
+			recordValue, recordType, err := serviceRecord(s)
+			if err != nil || recordValue == "" {
+				glog.Warningf("Couldn't find hostname or IP for %s: %s", s.Name, err)
+				continue
 			}
 
 			annotation, ok := s.ObjectMeta.Annotations["domainName"]
@@ -147,129 +143,91 @@ func main() {
 
 			domains := strings.Split(annotation, ",")
 			for j := range domains {
-				domain := domains[j]
+				recordName := domains[j]
 
-				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hostOrIp, domain)
+				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, recordValue, recordName)
 
-				zone, err := getDestinationZone(domain, r53Api)
+				zoneID, err := getDestinationZoneID(r53Api, recordName)
 				if err != nil {
-					glog.Warningf("Couldn't find destination zone: %s", err)
+					glog.Warningf("Couldn't find destination zone for %s: %s", recordName, err)
 					continue
 				}
 
-				zoneID := *zone.Id
-				zoneParts := strings.Split(zoneID, "/")
-				zoneID = zoneParts[len(zoneParts)-1]
-
-				if err = updateDNS(r53Api, hostOrIp, recordType, strings.TrimLeft(domain, "."), zoneID); err != nil {
+				if err = updateDNS(r53Api, recordValue, recordType, recordName, zoneID); err != nil {
 					glog.Warning(err)
 					continue
 				}
-				glog.Infof("Created dns record set: domain=%s, zoneID=%s", domain, zoneID)
+				glog.Infof("Created dns record set: domain=%s, zoneID=%s", recordName, zoneID)
 			}
 		}
 		time.Sleep(30 * time.Second)
 	}
 }
 
-func getDestinationZone(domain string, r53Api *route53.Route53) (*route53.HostedZone, error) {
-	tld, err := getTLD(domain)
+func getDestinationZoneID(r53Api *route53.Route53, domain string) (string, error) {
+	zone, err := publicsuffix.EffectiveTLDPlusOne(domain)
 	if err != nil {
-		return nil, err
+		return "", err
+	}
+	// Since Route53 returns it with dot at the end when listing zones.
+	zone += "."
+
+	params := &route53.ListHostedZonesByNameInput{
+		DNSName: aws.String(zone),
 	}
 
-	listHostedZoneInput := route53.ListHostedZonesByNameInput{
-		DNSName: &tld,
-	}
-	hzOut, err := r53Api.ListHostedZonesByName(&listHostedZoneInput)
+	resp, err := r53Api.ListHostedZonesByName(params)
 	if err != nil {
-		return nil, fmt.Errorf("No zone found for %s: %v", tld, err)
+		return "", err
 	}
-	// TODO: The AWS API may return multiple pages, we should parse them all
 
-	return findMostSpecificZoneForDomain(domain, hzOut.HostedZones)
+	// Does binary search on lexicographically ordered hosted zones slice, in
+	// order to find the correspondent Route53 zone ID for the given zone name.
+	l := len(resp.HostedZones)
+	i := sort.Search(l, func(i int) bool {
+		return *resp.HostedZones[i].Name == zone
+	})
+
+	var zoneID string
+	if i < l && *resp.HostedZones[i].Name == zone {
+		zoneID = strings.Split(*resp.HostedZones[i].Id, "/")[2]
+	} else {
+		return "", fmt.Errorf("unable to find hosted zone %q in Route53", zone)
+	}
+
+	return zoneID, nil
 }
 
-func findMostSpecificZoneForDomain(domain string, zones []*route53.HostedZone) (*route53.HostedZone, error) {
-	domain = domainWithTrailingDot(domain)
-	if len(zones) < 1 {
-		return nil, fmt.Errorf("No zone found for %s", domain)
-	}
-	var mostSpecific *route53.HostedZone
-	curLen := 0
-
-	for i := range zones {
-		zone := zones[i]
-		zoneName := *zone.Name
-
-		if strings.HasSuffix(domain, zoneName) && curLen < len(zoneName) {
-			curLen = len(zoneName)
-			mostSpecific = zone
-		}
-	}
-
-	if mostSpecific == nil {
-		return nil, fmt.Errorf("Zone found %s does not match domain given %s", *zones[0].Name, domain)
-	}
-
-	return mostSpecific, nil
-}
-
-func getTLD(domain string) (string, error) {
-	domainParts := strings.Split(domain, ".")
-	segments := len(domainParts)
-	if segments < 3 {
-		return "", fmt.Errorf("Domain %s is invalid - it should be a fully qualified domain name and subdomain (i.e. test.example.com)", domain)
-	}
-	return strings.Join(domainParts[segments-2:], "."), nil
-}
-
-func domainWithTrailingDot(withoutDot string) string {
-	if withoutDot[len(withoutDot)-1:] == "." {
-		return withoutDot
-	}
-	return fmt.Sprint(withoutDot, ".")
-}
-
-func serviceHostname(service *api.Service) (string, error) {
+func serviceRecord(service *api.Service) (string, string, error) {
 	ingress := service.Status.LoadBalancer.Ingress
 	if len(ingress) < 1 {
-		return "", errors.New("No ingress defined for ELB")
+		return "", "", errors.New("No ingress defined for ELB")
 	}
 	if len(ingress) > 1 {
-		return "", errors.New("Multiple ingress points found for ELB, not supported")
+		return "", "", errors.New("Multiple ingress points found for ELB, not supported")
 	}
-	return ingress[0].Hostname, nil
+	if ingress[0].IP != "" {
+		return ingress[0].IP, "A", nil
+	}
+	if ingress[0].Hostname != "" {
+		return ingress[0].Hostname, "CNAME", nil
+	}
+	return "", "", nil
 }
 
-func serviceIP(service *api.Service) (string, error) {
-	ingress := service.Status.LoadBalancer.Ingress
-	if len(ingress) < 1 {
-		return "", errors.New("No ingress defined for ELB")
-	}
-	if len(ingress) > 1 {
-		return "", errors.New("Multiple ingress points found for ELB, not supported")
-	}
-	return ingress[0].IP, nil
-}
-
-func updateDNS(r53Api *route53.Route53, hostOrIp, recordType, domain, zoneID string) error {
-	glog.Infof("hostOrIp: %s", hostOrIp)
-	glog.Infof("recordType: %s", recordType)
-	glog.Infof("domain: %s", domain)
-	glog.Infof("zoneID: %s", zoneID)
-
+func updateDNS(r53Api *route53.Route53, recordValue, recordType, recordName, zoneID string) error {
 	params := &route53.ChangeResourceRecordSetsInput{
 	    ChangeBatch: &route53.ChangeBatch{ // Required
 	        Changes: []*route53.Change{ // Required
 	            { // Required
 	                Action: aws.String("UPSERT"), // Required
 	                ResourceRecordSet: &route53.ResourceRecordSet{ // Required
-	                    Name: aws.String(domain), // Required
+	                    Name: aws.String(recordName), // Required
 	                    Type: aws.String(recordType),  // Required
+						TTL:  aws.Int64(10),
 	                    ResourceRecords: []*route53.ResourceRecord{
 	                        { // Required
-	                            Value: aws.String(hostOrIp), // Required
+	                            Value: aws.String(recordValue), // Required
 	                        },
 	                    },
 	                },
