@@ -102,8 +102,7 @@ func main() {
 	sess := session.New(awsConfig)
 
 	r53Api := route53.New(sess)
-	elbAPI := elb.New(sess)
-	if r53Api == nil || elbAPI == nil {
+	if r53Api == nil {
 		glog.Fatal("Failed to make AWS connection")
 	}
 
@@ -126,10 +125,18 @@ func main() {
 		glog.Infof("Found %d DNS services in all namespaces with selector %q", len(services.Items), selector)
 		for i := range services.Items {
 			s := &services.Items[i]
-			hn, err := serviceHostname(s)
-			if err != nil {
+
+			hostOrIp, err := serviceHostname(s)
+			recordType := "CNAME"
+			if err != nil || hostOrIp == "" {
 				glog.Warningf("Couldn't find hostname for %s: %s", s.Name, err)
-				continue
+				hostOrIp, err = serviceIP(s)
+				if err != nil || hostOrIp == "" {
+					glog.Warningf("Couldn't find IP for %s: %s", s.Name, err)
+					continue
+				} else {
+					recordType = "A"
+				}
 			}
 
 			annotation, ok := s.ObjectMeta.Annotations["domainName"]
@@ -142,12 +149,7 @@ func main() {
 			for j := range domains {
 				domain := domains[j]
 
-				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hn, domain)
-				elbZoneID, err := hostedZoneID(elbAPI, hn)
-				if err != nil {
-					glog.Warningf("Couldn't get zone ID: %s", err)
-					continue
-				}
+				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hostOrIp, domain)
 
 				zone, err := getDestinationZone(domain, r53Api)
 				if err != nil {
@@ -159,7 +161,7 @@ func main() {
 				zoneParts := strings.Split(zoneID, "/")
 				zoneID = zoneParts[len(zoneParts)-1]
 
-				if err = updateDNS(r53Api, hn, elbZoneID, strings.TrimLeft(domain, "."), zoneID); err != nil {
+				if err = updateDNS(r53Api, hostOrIp, recordType, strings.TrimLeft(domain, "."), zoneID); err != nil {
 					glog.Warning(err)
 					continue
 				}
@@ -240,77 +242,49 @@ func serviceHostname(service *api.Service) (string, error) {
 	return ingress[0].Hostname, nil
 }
 
-func loadBalancerNameFromHostname(hostname string) (string, error) {
-	var name string
-	hostnameSegments := strings.Split(hostname, "-")
-	if len(hostnameSegments) < 2 {
-		return name, fmt.Errorf("%s is not a valid ELB hostname", hostname)
+func serviceIP(service *api.Service) (string, error) {
+	ingress := service.Status.LoadBalancer.Ingress
+	if len(ingress) < 1 {
+		return "", errors.New("No ingress defined for ELB")
 	}
-	name = hostnameSegments[0]
-
-	// handle internal load balancer naming
-	if name == "internal" {
-		name = hostnameSegments[1]
+	if len(ingress) > 1 {
+		return "", errors.New("Multiple ingress points found for ELB, not supported")
 	}
-
-	return name, nil
+	return ingress[0].IP, nil
 }
 
-func hostedZoneID(elbAPI *elb.ELB, hostname string) (string, error) {
-	elbName, err := loadBalancerNameFromHostname(hostname)
-	if err != nil {
-		return "", fmt.Errorf("Couldn't parse ELB hostname: %v", err)
-	}
-	lbInput := &elb.DescribeLoadBalancersInput{
-		LoadBalancerNames: []*string{
-			&elbName,
-		},
-	}
-	resp, err := elbAPI.DescribeLoadBalancers(lbInput)
-	if err != nil {
-		return "", fmt.Errorf("Could not describe load balancer: %v", err)
-	}
-	descs := resp.LoadBalancerDescriptions
-	if len(descs) < 1 {
-		return "", fmt.Errorf("No lb found: %v", err)
-	}
-	if len(descs) > 1 {
-		return "", fmt.Errorf("Multiple lbs found: %v", err)
-	}
-	return *descs[0].CanonicalHostedZoneNameID, nil
-}
+func updateDNS(r53Api *route53.Route53, hostOrIp, recordType, domain, zoneID string) error {
+	glog.Infof("hostOrIp: %s", hostOrIp)
+	glog.Infof("recordType: %s", recordType)
+	glog.Infof("domain: %s", domain)
+	glog.Infof("zoneID: %s", zoneID)
 
-func updateDNS(r53Api *route53.Route53, hn, hzID, domain, zoneID string) error {
-	at := route53.AliasTarget{
-		DNSName:              &hn,
-		EvaluateTargetHealth: aws.Bool(false),
-		HostedZoneId:         &hzID,
-	}
-	rrs := route53.ResourceRecordSet{
-		AliasTarget: &at,
-		Name:        &domain,
-		Type:        aws.String("A"),
-	}
-	change := route53.Change{
-		Action:            aws.String("UPSERT"),
-		ResourceRecordSet: &rrs,
-	}
-	batch := route53.ChangeBatch{
-		Changes: []*route53.Change{&change},
-		Comment: aws.String("Kubernetes Update to Service"),
-	}
-	crrsInput := route53.ChangeResourceRecordSetsInput{
-		ChangeBatch:  &batch,
-		HostedZoneId: &zoneID,
-	}
-	if dryRun {
-		glog.Infof("DRY RUN: We normally would have updated %s to point to %s (%s)", zoneID, hzID, hn)
-		return nil
+	params := &route53.ChangeResourceRecordSetsInput{
+	    ChangeBatch: &route53.ChangeBatch{ // Required
+	        Changes: []*route53.Change{ // Required
+	            { // Required
+	                Action: aws.String("UPSERT"), // Required
+	                ResourceRecordSet: &route53.ResourceRecordSet{ // Required
+	                    Name: aws.String(domain), // Required
+	                    Type: aws.String(recordType),  // Required
+	                    ResourceRecords: []*route53.ResourceRecord{
+	                        { // Required
+	                            Value: aws.String(hostOrIp), // Required
+	                        },
+	                    },
+	                },
+	            },
+	        },
+	        Comment: aws.String("Kubernetes Update to Service"),
+	    },
+	    HostedZoneId: aws.String(zoneID), // Required
 	}
 
-	_, err := r53Api.ChangeResourceRecordSets(&crrsInput)
+	resp, err := r53Api.ChangeResourceRecordSets(params)
+	glog.Infof("Response: %v", resp)
 	if err != nil {
 		return fmt.Errorf("Failed to update record set: %v", err)
 	}
+
 	return nil
 }
