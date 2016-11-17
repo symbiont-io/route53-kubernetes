@@ -88,9 +88,12 @@ func main() {
 			&ec2rolecreds.EC2RoleProvider{Client: metadata},
 		})
 
-	region, err := metadata.Region()
-	if err != nil {
-		glog.Fatalf("Unable to retrieve the region from the EC2 instance %v\n", err)
+	region := os.Getenv("AWS_DEFAULT_REGION")
+	if region == "" {
+		region, err = metadata.Region()
+		if err != nil {
+			glog.Fatalf("Unable to retrieve the region from environment or the EC2 instance %v\n", err)
+		}
 	}
 
 	awsConfig := aws.NewConfig()
