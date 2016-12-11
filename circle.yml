@@ -1,0 +1,32 @@
+machine:
+    pre:
+        # Install Docker 1.10.0
+        - curl -sSL https://s3.amazonaws.com/circle-downloads/install-circleci-docker.sh | bash -s -- 1.10.0
+    services:
+        - docker
+    post:
+        - aws ecr get-login | sh -      # TODO
+
+dependencies:
+    pre:
+        # GCP
+        - echo $GCLOUD_SERVICE_KEY_PROJECT_DEVELOPMENT | base64 --decode > ${HOME}/gcloud-service-key-project-development.json
+        - sudo /opt/google-cloud-sdk/bin/gcloud --quiet components update
+        - sudo /opt/google-cloud-sdk/bin/gcloud auth activate-service-account --key-file ${HOME}/gcloud-service-key-project-development.json
+        - sudo /opt/google-cloud-sdk/bin/gcloud config set project development-148212
+    override:
+        - echo "test" # TODO(ouziel)
+
+test:
+    override:
+        - echo "test"
+
+deployment:
+    tag_images:
+        tag: /v.*/
+        commands:
+            - docker build -t "815170638674.dkr.ecr.us-east-1.amazonaws.com/route53-kubernetes:$CIRCLE_TAG" .
+            - docker push "815170638674.dkr.ecr.us-east-1.amazonaws.com/route53-kubernetes:$CIRCLE_TAG"
+
+            - docker build -t "us.gcr.io/development-148212/route53-kubernetes:$CIRCLE_TAG" .
+            - sudo /opt/google-cloud-sdk/bin/gcloud docker -- push "us.gcr.io/development-148212/route53-kubernetes:$CIRCLE_TAG"
