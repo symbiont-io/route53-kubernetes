@@ -29,6 +29,8 @@ import (
 // Don't actually commit the changes to route53 records, just print out what we would have done.
 var dryRun bool
 
+var currentRecords map[string]string
+
 func init() {
 	dryRunStr := os.Getenv("DRY_RUN")
 	if dryRunStr != "" {
@@ -119,6 +121,8 @@ func main() {
 	}
 
 	glog.Infof("Starting Service Polling every 30s")
+	// TODO(ouziel): delete record if necessary
+	currentRecords = make(map[string]string)
 	for {
 		services, err := c.Services(api.NamespaceAll).List(listOptions)
 		if err != nil {
@@ -145,6 +149,12 @@ func main() {
 			for j := range domains {
 				recordName := domains[j]
 
+				currentValue, exists = currentRecords[recordName]
+				if currentValue == recordValue {
+					glog.Infof("DNS already exists for %s service: %s -> %s", s.Name, recordValue, recordName)
+					continue
+				}
+
 				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, recordValue, recordName)
 
 				zoneID, err := getDestinationZoneID(r53Api, recordName)
@@ -157,6 +167,7 @@ func main() {
 					glog.Warning(err)
 					continue
 				}
+				currentRecords[recordName] = recordValue
 				glog.Infof("Created dns record set: domain=%s, zoneID=%s", recordName, zoneID)
 			}
 		}
