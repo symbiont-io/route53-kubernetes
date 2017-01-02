@@ -231,7 +231,7 @@ func updateDNS(r53Api *route53.Route53, recordValue, recordType, recordName, zon
 	                ResourceRecordSet: &route53.ResourceRecordSet{ // Required
 	                    Name: aws.String(recordName), // Required
 	                    Type: aws.String(recordType),  // Required
-						TTL:  aws.Int64(10),
+						TTL:  aws.Int64(3600),
 	                    ResourceRecords: []*route53.ResourceRecord{
 	                        { // Required
 	                            Value: aws.String(recordValue), // Required
