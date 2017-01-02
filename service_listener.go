@@ -19,11 +19,11 @@ import (
 
 	"golang.org/x/net/publicsuffix"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/restclient"
 	"k8s.io/kubernetes/pkg/client/transport"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/labels"
+
+	"k8s.io/client-go/kubernetes"
+	api "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/rest"
 )
 
 // Don't actually commit the changes to route53 records, just print out what we would have done.
@@ -42,7 +42,7 @@ func main() {
 	flag.Parse()
 	glog.Info("Route53 Update Service")
 
-	config, err := restclient.InClusterConfig()
+	config, err := rest.InClusterConfig()
 	if err != nil {
 		kubernetesService := os.Getenv("KUBERNETES_SERVICE_HOST")
 		kubernetesServicePort := os.Getenv("KUBERNETES_SERVICE_PORT")
@@ -72,13 +72,13 @@ func main() {
 			glog.Fatalf("Couldn't set up tls transport: %s", err)
 		}
 
-		config = &restclient.Config{
+		config = &rest.Config{
 			Host:      apiServer,
 			Transport: tlsTransport,
 		}
 	}
 
-	c, err := client.New(config)
+	c, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		glog.Fatalf("Failed to make client: %v", err)
 	}
@@ -112,12 +112,8 @@ func main() {
 	}
 
 	selector := "dns=route53"
-	l, err := labels.Parse(selector)
-	if err != nil {
-		glog.Fatalf("Failed to parse selector %q: %v", selector, err)
-	}
 	listOptions := api.ListOptions{
-		LabelSelector: l,
+		LabelSelector: selector,
 	}
 
 	glog.Infof("Starting Service Polling every 30s")
@@ -149,7 +145,7 @@ func main() {
 			for j := range domains {
 				recordName := domains[j]
 
-				currentValue, exists = currentRecords[recordName]
+				currentValue, _ := currentRecords[recordName]
 				if currentValue == recordValue {
 					glog.Infof("DNS already exists for %s service: %s -> %s", s.Name, recordValue, recordName)
 					continue
